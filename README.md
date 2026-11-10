@@ -180,6 +180,14 @@ matching SNS notification task. The SNS message is built with
 
 All three failure paths converge on the `PipelineFailed` terminal state.
 
+**Failed pipeline — Step Functions console view:**
+
+![Failed Pipeline — Step Functions Graph View](images/failed_pipeline.png)
+
+**Sample failure notification received via email:**
+
+![Failed Pipeline — SNS Email Notification](images/failed_pipeline_mail.png)
+
 ### SNS Topic
 
 | SNS Topic | `mission-deh-hof-pipeline-alerts` |

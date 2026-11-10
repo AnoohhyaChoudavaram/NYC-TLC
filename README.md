@@ -17,41 +17,7 @@ alerts and **DynamoDB** job-audit tracking on every run.
 
 ## Architecture
 
-```
-                         ┌──────────────────────────────┐
-                         │  EventBridge Scheduler        │
-                         │  (cron — monthly trigger)    │
-                         └──────────────┬───────────────┘
-                                        │
-                                        ▼
-                         ┌──────────────────────────────┐
-                         │  Step Functions State Machine │
-                         │  mission-deh-hof-pipeline     │
-                         └──┬─────────┬─────────┬───────┘
-            ┌───────────────┘         │         └───────────────┐
-            ▼                         ▼                         ▼
-  ┌─────────────────────┐  ┌─────────────────────┐  ┌───────────────────────┐
-  │ Glue Python Shell    │  │ Glue ETL (Spark)    │  │ Glue ETL (Spark)      │
-  │ Ingestion            │  │ Raw → Curated       │  │ Curated → Aggregated  │
-  │ nyctlc-ingestion.py  │  │ raw-to-curated.py   │  │ curated-to-aggregated │
-  └──────────┬──────────┘  └──────────┬──────────┘  └───────────┬───────────┘
-             │                         │                         │
-             ▼                         ▼                         ▼
-       ┌───────────────────────────────────────────────────────────────┐
-       │                      Amazon S3 (Medallion)                     │
-       │   raw/  ──►  curated/  ──►  aggregated/                        │
-       └───────────────────────────────────────────────────────────────┘
-             │                         │                         │
-             │            ┌────────────┴──────────┐                  │
-             │            ▼                       ▼                  │
-             │  Glue Crawlers            DynamoDB (job audit)         │
-             │            │                       │                  │
-             │            ▼                       │                  │
-             │     Data Catalog  ◄── Athena (analyst self-service)    │
-             │                                                         │
-             ▼                                                         │
-       Lambda (S3 event-driven trigger for real-time processing) ─────┘
-```
+![NYC TLC — Lyft (HVFHV) Data Engineering Pipeline](images/Flow%20Diagram.png)
 
 **SNS** notifications fire on every pipeline success and on any step failure.
 **S3 Lifecycle rules** transition data across storage tiers for cost
@@ -179,18 +145,85 @@ Produces 3 aggregate tables:
 
 ## Orchestration — Step Functions (`mission-deh-hof-pipeline-state-machine.json`)
 
-The state machine runs the three Glue jobs **synchronously** in sequence:
+The ASL state machine runs the three Glue jobs **synchronously** in sequence
+using the `arn:aws:states:::glue:startJobRun.sync` resource pattern, which
+blocks until each Glue job run completes before advancing to the next step.
 
+### Execution Flow
 ```
-StartIngestionJob ──► StartRawToCuratedJob ──► StartCuratedToAggregatedJob ──► NotifyPipelineSuccess ──► PipelineSucceeded
+                          ┌─────────────────────────────────┐
+                          │  StartIngestionJob              │
+                          │  glue:startJobRun.sync          │
+                          │  JobName: mission-deh-hof-      │
+                          │           nyctlc-ingestion      │
+                          └───────────────┬─────────────────┘
+                                  success │        │ failure (Catch)
+                                          ▼        ▼
+                          ┌─────────────────────┐  ┌─────────────────────────┐
+                          │ StartRawToCuratedJob│  │ NotifyIngestionFailure  │──► SNS
+                          │ glue:startJobRun.sync│  └─────────────────────────┘
+                          │ JobName: mission-    │
+                          │  deh-hof-raw-to-    │
+                          │  curated-etl        │
+                          └───────────┬─────────┘
+                              success │        │ failure (Catch)
+                                      ▼        ▼
+                          ┌──────────────────────┐  ┌─────────────────────────────┐
+                          │StartCuratedToAggregate│  │ NotifyRawToCuratedFailure  │──► SNS
+                          │ dJob                  │  └─────────────────────────────┘
+                          │ glue:startJobRun.sync │
+                          │ JobName: mission-deh- │
+                          │  hof-curated-to-     │
+                          │  aggregated-etl     │
+                          └───────────┬──────────┘
+                              success │        │ failure (Catch)
+                                      ▼        ▼
+                          ┌────────────────────────┐  ┌──────────────────────────────┐
+                          │ NotifyPipelineSuccess  │  │ NotifyCuratedToAggregatedFail│──► SNS
+                          │ ──► PipelineSucceeded  │  └──────────────────────────────┘
+                          └────────────────────────┘            │
+                                                                 ▼
+                                                        ┌──────────────────┐
+                                                        │  PipelineFailed  │
+                                                        │  (Fail state)    │
+                                                        └──────────────────┘
 ```
 
-Each step has a **Catch** that routes failures to a dedicated **SNS** notification
-task (message includes the failing step + Glue job name + error/cause) before
-ending in `PipelineFailed`.
+### State Definitions
+
+| State | Type | Resource | Purpose |
+|---|---|---|---|
+| `StartIngestionJob` | Task | `glue:startJobRun.sync` | Runs `mission-deh-hof-nyctlc-ingestion`; on success → `StartRawToCuratedJob` |
+| `StartRawToCuratedJob` | Task | `glue:startJobRun.sync` | Runs `mission-deh-hof-raw-to-curated-etl`; on success → `StartCuratedToAggregatedJob` |
+| `StartCuratedToAggregatedJob` | Task | `glue:startJobRun.sync` | Runs `mission-deh-hof-curated-to-aggregated-etl`; on success → `NotifyPipelineSuccess` |
+| `NotifyIngestionFailure` | Task | `sns:publish` | Publishes step-1 failure details (job name + error + cause) → `PipelineFailed` |
+| `NotifyRawToCuratedFailure` | Task | `sns:publish` | Publishes step-2 failure details → `PipelineFailed` |
+| `NotifyCuratedToAggregatedFailure` | Task | `sns:publish` | Publishes step-3 failure details → `PipelineFailed` |
+| `NotifyPipelineSuccess` | Task | `sns:publish` | Publishes success summary (all 3 jobs) → `PipelineSucceeded` |
+| `PipelineFailed` | Fail | — | Terminal failure; error `PipelineExecutionFailed` |
+| `PipelineSucceeded` | Succeed | — | Terminal success |
+
+### Error Handling (Catch blocks)
+
+Each Glue Task state includes a `Catch` that captures `States.ALL` errors,
+stashes the error into `$.error` (`ResultPath: "$.error"`), and routes to the
+matching SNS notification task. The SNS message is built with
+`States.Format(...)` so the published alert includes:
+
+- The failing **step name** (e.g. `StartIngestionJob`)
+- The **Glue job name** (e.g. `mission-deh-hof-nyctlc-ingestion`)
+- The **error** and **cause** from the failed run
+
+All three failure paths converge on the `PipelineFailed` terminal state.
+
+### SNS Topic
 
 | SNS Topic | `mission-deh-hof-pipeline-alerts` |
 |---|---|
+
+The success notification confirms all 3 Glue jobs completed; failure
+notifications identify exactly which step and job failed along with the
+error details.
 
 ### Triggers
 

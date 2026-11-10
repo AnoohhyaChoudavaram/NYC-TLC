@@ -150,44 +150,8 @@ using the `arn:aws:states:::glue:startJobRun.sync` resource pattern, which
 blocks until each Glue job run completes before advancing to the next step.
 
 ### Execution Flow
-```
-                          ┌─────────────────────────────────┐
-                          │  StartIngestionJob              │
-                          │  glue:startJobRun.sync          │
-                          │  JobName: mission-deh-hof-      │
-                          │           nyctlc-ingestion      │
-                          └───────────────┬─────────────────┘
-                                  success │        │ failure (Catch)
-                                          ▼        ▼
-                          ┌─────────────────────┐  ┌─────────────────────────┐
-                          │ StartRawToCuratedJob│  │ NotifyIngestionFailure  │──► SNS
-                          │ glue:startJobRun.sync│  └─────────────────────────┘
-                          │ JobName: mission-    │
-                          │  deh-hof-raw-to-    │
-                          │  curated-etl        │
-                          └───────────┬─────────┘
-                              success │        │ failure (Catch)
-                                      ▼        ▼
-                          ┌──────────────────────┐  ┌─────────────────────────────┐
-                          │StartCuratedToAggregate│  │ NotifyRawToCuratedFailure  │──► SNS
-                          │ dJob                  │  └─────────────────────────────┘
-                          │ glue:startJobRun.sync │
-                          │ JobName: mission-deh- │
-                          │  hof-curated-to-     │
-                          │  aggregated-etl     │
-                          └───────────┬──────────┘
-                              success │        │ failure (Catch)
-                                      ▼        ▼
-                          ┌────────────────────────┐  ┌──────────────────────────────┐
-                          │ NotifyPipelineSuccess  │  │ NotifyCuratedToAggregatedFail│──► SNS
-                          │ ──► PipelineSucceeded  │  └──────────────────────────────┘
-                          └────────────────────────┘            │
-                                                                 ▼
-                                                        ┌──────────────────┐
-                                                        │  PipelineFailed  │
-                                                        │  (Fail state)    │
-                                                        └──────────────────┘
-```
+
+![Step Functions Pipeline — Graph View](images/stepfunction_pipeline.png)
 
 ### State Definitions
 
@@ -224,6 +188,10 @@ All three failure paths converge on the `PipelineFailed` terminal state.
 The success notification confirms all 3 Glue jobs completed; failure
 notifications identify exactly which step and job failed along with the
 error details.
+
+**Sample success notification received via email:**
+
+![Pipeline Success SNS Notification](images/success_pipeline.png)
 
 ### Triggers
 
